@@ -1,5 +1,5 @@
 {
-  "name": "sallasync",
+  "name": "shopify-salla-sync",
   "version": "1.0.0",
   "type": "module",
   "scripts": {

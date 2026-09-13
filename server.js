@@ -16,19 +16,20 @@ app.get("/", (req, res) => {
 
 
 /* =========================================================
-   OPTIONAL SHOPIFY WEBHOOK VERIFICATION
-   If SHOPIFY_WEBHOOK_SECRET is not set yet,
-   the webhook will still work for testing.
+   SHOPIFY WEBHOOK VERIFICATION
 ========================================================= */
 
 function verifyShopifyWebhook(req) {
   const secret = process.env.SHOPIFY_WEBHOOK_SECRET;
 
-  // Testing mode
+  // Temporary testing mode:
+  // if you haven't added Shopify secret yet,
+  // allow webhook to continue.
   if (!secret) {
     console.warn(
-      "⚠️ SHOPIFY_WEBHOOK_SECRET not set - skipping HMAC verification"
+      "SHOPIFY_WEBHOOK_SECRET not configured - verification skipped"
     );
+
     return true;
   }
 
@@ -78,25 +79,25 @@ app.post(
   async (req, res) => {
     try {
 
-      /* -----------------------------------------------------
+      /* --------------------------------------------------
          VERIFY SHOPIFY
-      ----------------------------------------------------- */
+      -------------------------------------------------- */
 
       if (!verifyShopifyWebhook(req)) {
         console.error(
-          "❌ Invalid Shopify webhook signature"
+          "Invalid Shopify webhook signature"
         );
 
         return res.status(401).json({
           success: false,
-          error: "Invalid Shopify signature"
+          error: "Invalid Shopify webhook signature"
         });
       }
 
 
-      /* -----------------------------------------------------
-         READ SHOPIFY ORDER
-      ----------------------------------------------------- */
+      /* --------------------------------------------------
+         PARSE SHOPIFY ORDER
+      -------------------------------------------------- */
 
       const order = JSON.parse(
         req.body.toString("utf8")
@@ -126,15 +127,19 @@ app.post(
         order.currency
       );
 
+      console.log(
+        "Financial status:",
+        order.financial_status
+      );
 
-      /* -----------------------------------------------------
+
+      /* --------------------------------------------------
          CHECK SALLA TOKEN
-      ----------------------------------------------------- */
+      -------------------------------------------------- */
 
       if (!process.env.SALLA_ACCESS_TOKEN) {
-
         console.error(
-          "❌ SALLA_ACCESS_TOKEN missing"
+          "SALLA_ACCESS_TOKEN is missing"
         );
 
         return res.status(500).json({
@@ -145,58 +150,47 @@ app.post(
       }
 
 
-      /* -----------------------------------------------------
+      /* --------------------------------------------------
          PRODUCTS
-      ----------------------------------------------------- */
+      -------------------------------------------------- */
 
       const products =
         (order.line_items || []).map(
           (item) => {
 
-            /*
-             Shopify gives tax lines
-             separately for each item.
-            */
-
             const itemTaxValue =
-              (item.tax_lines || [])
-                .reduce(
-                  (total, tax) => {
+              (item.tax_lines || []).reduce(
+                (total, tax) => {
 
-                    const value =
-                      tax.price ??
-                      tax.price_set
-                        ?.shop_money
-                        ?.amount ??
-                      0;
+                  const value =
+                    tax.price ??
+                    tax.price_set
+                      ?.shop_money
+                      ?.amount ??
+                    0;
 
-                    return (
-                      total +
-                      Number(value)
-                    );
-
-                  },
-                  0
-                );
+                  return (
+                    total +
+                    Number(value)
+                  );
+                },
+                0
+              );
 
 
             const itemTaxRate =
-              (item.tax_lines || [])
-                .reduce(
-                  (total, tax) => {
+              (item.tax_lines || []).reduce(
+                (total, tax) => {
 
-                    return (
-                      total +
-                      (
-                        Number(
-                          tax.rate || 0
-                        ) * 100
-                      )
-                    );
-
-                  },
-                  0
-                );
+                  return (
+                    total +
+                    Number(
+                      tax.rate || 0
+                    ) * 100
+                  );
+                },
+                0
+              );
 
 
             return {
@@ -211,7 +205,8 @@ app.post(
                   item.price || 0
                 ),
 
-              cost_price: 0,
+              cost_price:
+                0,
 
               sku:
                 item.sku || "",
@@ -226,7 +221,8 @@ app.post(
                   item.quantity || 1
                 ),
 
-              weight_type: "g",
+              weight_type:
+                "g",
 
               require_shipping:
                 item.requires_shipping === false
@@ -238,14 +234,10 @@ app.post(
 
               product_discount:
                 Number(
-                  item.total_discount ||
-                  0
+                  item.total_discount || 0
                 ),
 
-              /*
-               IMPORTANT:
-               Salla requires product tax.value
-              */
+              /* REQUIRED BY SALLA */
 
               tax: {
                 rate:
@@ -263,9 +255,9 @@ app.post(
         );
 
 
-      /* -----------------------------------------------------
-         SHIPPING COST
-      ----------------------------------------------------- */
+      /* --------------------------------------------------
+         SHIPPING
+      -------------------------------------------------- */
 
       const shippingCost =
         (order.shipping_lines || [])
@@ -278,15 +270,14 @@ app.post(
                   shipping.price || 0
                 )
               );
-
             },
             0
           );
 
 
-      /* -----------------------------------------------------
+      /* --------------------------------------------------
          ORDER TAX
-      ----------------------------------------------------- */
+      -------------------------------------------------- */
 
       const totalTax =
         Number(
@@ -294,28 +285,25 @@ app.post(
         );
 
 
-      const taxRate =
+      const orderTaxRate =
         (order.tax_lines || [])
           .reduce(
             (total, tax) => {
 
               return (
                 total +
-                (
-                  Number(
-                    tax.rate || 0
-                  ) * 100
-                )
+                Number(
+                  tax.rate || 0
+                ) * 100
               );
-
             },
             0
           );
 
 
-      /* -----------------------------------------------------
+      /* --------------------------------------------------
          PAYMENT
-      ----------------------------------------------------- */
+      -------------------------------------------------- */
 
       const gateway =
         order.payment_gateway_names?.[0] ||
@@ -327,18 +315,16 @@ app.post(
         gateway.toLowerCase();
 
 
-      /*
-       Keep payment methods simple
-       while we're testing.
-      */
-
       let paymentMethod =
         "credit_card";
 
 
       if (
         gatewayLower.includes("cash") ||
-        gatewayLower.includes("cod")
+        gatewayLower.includes("cod") ||
+        gatewayLower.includes(
+          "cash on delivery"
+        )
       ) {
 
         paymentMethod =
@@ -350,26 +336,54 @@ app.post(
 
         paymentMethod =
           "bank";
+
+      } else if (
+        gatewayLower.includes("mada")
+      ) {
+
+        paymentMethod =
+          "credit_card";
+
+      } else if (
+        gatewayLower.includes("visa") ||
+        gatewayLower.includes("master")
+      ) {
+
+        paymentMethod =
+          "credit_card";
       }
 
 
       /*
-       FIX:
-       "pending" was rejected by Salla.
+       For the External Orders endpoint,
+       Salla's documented example uses "paid".
 
-       Salla documents pending_payment
-       for orders waiting for payment.
+       For now:
+       - Shopify paid => paid
+       - COD => paid (external order already exists)
+       - Other Shopify orders => paid
+
+       We can refine payment state sync later.
       */
 
       const paymentStatus =
-        order.financial_status === "paid"
-          ? "paid"
-          : "pending_payment";
+        "paid";
 
 
-      /* -----------------------------------------------------
+      /*
+       IMPORTANT:
+       This is the field Salla is currently
+       asking us for.
+      */
+
+      const acceptedMethods = [
+        paymentMethod
+      ];
+
+
+      /* --------------------------------------------------
          CUSTOMER / RECEIVER
-      ----------------------------------------------------- */
+      -------------------------------------------------- */
 
       const address =
         order.shipping_address ||
@@ -379,16 +393,14 @@ app.post(
 
       const receiverName =
         address.name ||
-
         `${order.customer?.first_name || ""} ${
           order.customer?.last_name || ""
         }`.trim() ||
-
         "Shopify Customer";
 
 
       const phone =
-        (
+        String(
           address.phone ||
           order.phone ||
           order.customer?.phone ||
@@ -403,17 +415,16 @@ app.post(
 
 
       const countryCode =
-        (
+        String(
           address.country_code ||
           address.country_code_v2 ||
           "EG"
-        )
-          .toLowerCase();
+        ).toLowerCase();
 
 
-      /* -----------------------------------------------------
+      /* --------------------------------------------------
          DISCOUNTS
-      ----------------------------------------------------- */
+      -------------------------------------------------- */
 
       const discountCode =
         order.discount_codes?.[0]?.code ||
@@ -426,9 +437,56 @@ app.post(
         );
 
 
-      /* -----------------------------------------------------
+      /* --------------------------------------------------
+         BUILD PAYMENT OBJECT
+      -------------------------------------------------- */
+
+      const payment = {
+
+        status:
+          paymentStatus,
+
+        method:
+          paymentMethod,
+
+        accepted_methods:
+          acceptedMethods,
+
+        gateway: {
+
+          label:
+            gateway,
+
+          reference_id:
+            String(order.id)
+        }
+      };
+
+
+      /*
+       Only include COD object for COD orders.
+      */
+
+      if (
+        paymentMethod === "cod"
+      ) {
+
+        payment.cash_on_delivery = {
+
+          amount:
+            Number(
+              order.total_price || 0
+            ),
+
+          currency:
+            order.currency || "EGP"
+        };
+      }
+
+
+      /* --------------------------------------------------
          BUILD SALLA PAYLOAD
-      ----------------------------------------------------- */
+      -------------------------------------------------- */
 
       const sallaPayload = {
 
@@ -439,10 +497,7 @@ app.post(
           order.created_at
             ? order.created_at
                 .slice(0, 16)
-                .replace(
-                  "T",
-                  " "
-                )
+                .replace("T", " ")
             : undefined,
 
         currency:
@@ -463,9 +518,10 @@ app.post(
         /* ORDER TAX */
 
         tax: {
+
           rate:
             Number(
-              taxRate.toFixed(4)
+              orderTaxRate.toFixed(4)
             ),
 
           value:
@@ -483,6 +539,7 @@ app.post(
         /* DISCOUNTS */
 
         discounts: {
+
           code:
             discountCode,
 
@@ -496,46 +553,14 @@ app.post(
 
         /* PAYMENT */
 
-        payment: {
-
-          status:
-            paymentStatus,
-
-          method:
-            paymentMethod,
-
-          gateway: {
-
-            label:
-              gateway,
-
-            reference_id:
-              String(order.id)
-          },
-
-          ...(paymentMethod === "cod"
-            ? {
-                cash_on_delivery: {
-
-                  amount:
-                    Number(
-                      order.total_price ||
-                      0
-                    )
-                }
-              }
-            : {})
-        },
+        payment,
 
 
         /*
-         FIX:
          Salla requires receiver.phone
-         whenever receiver exists.
+         whenever receiver is supplied.
 
-         Therefore receiver is only
-         included when Shopify actually
-         supplied a phone.
+         So no phone = don't send receiver yet.
         */
 
         ...(phone
@@ -570,9 +595,9 @@ app.post(
       };
 
 
-      /* -----------------------------------------------------
-         DEBUG WITHOUT SHOWING SECRETS
-      ----------------------------------------------------- */
+      /* --------------------------------------------------
+         LOG WHAT WE ARE SENDING
+      -------------------------------------------------- */
 
       console.log(
         "Sending Shopify order to Salla:",
@@ -585,7 +610,7 @@ app.post(
       );
 
       console.log(
-        "Receiver phone available:",
+        "Phone available:",
         Boolean(phone)
       );
 
@@ -599,10 +624,15 @@ app.post(
         paymentMethod
       );
 
+      console.log(
+        "Accepted methods:",
+        acceptedMethods
+      );
 
-      /* -----------------------------------------------------
-         SEND TO SALLA
-      ----------------------------------------------------- */
+
+      /* --------------------------------------------------
+         CALL SALLA
+      -------------------------------------------------- */
 
       const sallaResponse =
         await fetch(
@@ -610,7 +640,8 @@ app.post(
           "https://api.salla.dev/admin/v2/orders/external",
 
           {
-            method: "POST",
+            method:
+              "POST",
 
             headers: {
 
@@ -632,9 +663,9 @@ app.post(
         );
 
 
-      /* -----------------------------------------------------
-         READ SALLA RESPONSE
-      ----------------------------------------------------- */
+      /* --------------------------------------------------
+         READ RESPONSE
+      -------------------------------------------------- */
 
       const responseText =
         await sallaResponse.text();
@@ -673,9 +704,9 @@ app.post(
       );
 
 
-      /* -----------------------------------------------------
-         SALLA ERROR
-      ----------------------------------------------------- */
+      /* --------------------------------------------------
+         VALIDATION ERROR
+      -------------------------------------------------- */
 
       if (!sallaResponse.ok) {
 
@@ -734,31 +765,36 @@ app.post(
       }
 
 
-      /* -----------------------------------------------------
+      /* --------------------------------------------------
          SUCCESS
-      ----------------------------------------------------- */
+      -------------------------------------------------- */
+
+      console.log(
+        "================================="
+      );
 
       console.log(
         "✅ SHOPIFY ORDER CREATED IN SALLA"
       );
 
-
       console.log(
-        "Shopify Order:",
+        "Shopify:",
         order.id
       );
 
-
       console.log(
-        "Salla Order:",
+        "Salla:",
         sallaResult?.data?.id
       );
 
-
       console.log(
-        "Salla Reference:",
+        "Salla reference:",
         sallaResult?.data
           ?.reference_id
+      );
+
+      console.log(
+        "================================="
       );
 
 
@@ -785,7 +821,7 @@ app.post(
     } catch (error) {
 
       console.error(
-        "❌ Shopify → Salla error:",
+        "SHOPIFY → SALLA ERROR:",
         error
       );
 
@@ -834,9 +870,7 @@ app.post(
 
 
       /*
-       IMPORTANT:
-       Never print access_token or
-       refresh_token into production logs.
+       Never log Salla access/refresh tokens.
       */
 
 
